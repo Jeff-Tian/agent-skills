@@ -1,657 +1,214 @@
 ---
 name: oidc-integration
-description: Guidelines for integrating OIDC providers (e.g., Authing, IdentityServer, Keycloak) into frontend and backend applications. Use when implementing authentication, token refresh, or multi-provider auth systems.
+description: Plan and implement OIDC and OAuth 2.0 integration for React or TypeScript frontends and Java or Spring Boot backends. Use whenever the user mentions OIDC, OpenID Connect, OAuth login, SSO, PKCE, authorization code flow, refresh tokens, JWT or JWKS validation, login callback pages, protected routes, Keycloak, Auth0, IdentityServer, Authing, multi-provider auth, or "add login" and "integrate IdP" style requests even if they do not explicitly say OIDC.
 ---
 
-# OIDC Provider Integration Guide
+# OIDC Integration
 
-## Overview
+Use this skill to design or implement authentication flows that rely on an OpenID Connect provider.
 
-This skill covers integrating OpenID Connect (OIDC) providers into web applications with:
-- Frontend (React/TypeScript) authentication flow
-- Backend (Java/Spring Boot) token validation
-- Dual-provider support (e.g., admin vs user auth)
-- Token refresh mechanism
-- PKCE support for public clients
+## Objective
 
-## When to Use
+Help the user integrate OIDC in a way that matches their architecture, avoids unsafe defaults, and produces code that fits the current stack instead of dumping generic samples.
 
-- Adding OIDC authentication to an application
-- Integrating multiple OIDC providers
-- Implementing token refresh with offline_access
-- Handling 401 responses with auto re-login
-- Setting up protected routes
+## Working Style
 
-## Frontend Integration (React + TypeScript)
+Start by identifying the actual integration shape before writing code.
 
-### 1. OIDC Configuration File
+Check these points first:
 
-Create a config file for each OIDC provider:
+- Which side owns auth state: SPA only, backend session, or BFF.
+- Which provider is involved: Keycloak, Auth0, IdentityServer, Authing, Azure AD, or another OIDC-compliant IdP.
+- Whether there is one provider or multiple providers.
+- Whether the client is public or confidential.
+- Whether refresh tokens are required.
+- Whether the user needs login only, login plus logout, route protection, token validation, or full end-to-end flow.
+- Whether the codebase already uses auth libraries that should be extended rather than replaced.
 
-```typescript
-// src/config/userOidc.ts
-export const USER_OIDC_CONFIG = {
-  authority: import.meta.env.VITE_USER_OIDC_AUTHORITY, // e.g., https://idp.example.com
-  clientId: import.meta.env.VITE_USER_OIDC_CLIENT_ID,
-  redirectUri: `${window.location.origin}/auth/callback`,
-  scope: import.meta.env.VITE_USER_OIDC_SCOPE || 'openid profile email offline_access',
-  responseType: 'code',
-};
+If the user only needs one layer, stay scoped to that layer. Do not generate both frontend and backend integration unless the task actually spans both.
 
-// PKCE utilities
-export function generateCodeVerifier(): string {
-  const array = new Uint8Array(32);
-  crypto.getRandomValues(array);
-  return base64UrlEncode(array);
-}
+## Security Defaults
 
-export async function generateCodeChallenge(verifier: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(verifier);
-  const digest = await crypto.subtle.digest('SHA-256', data);
-  return base64UrlEncode(new Uint8Array(digest));
-}
+Apply these defaults unless the user explicitly needs something different:
 
-function base64UrlEncode(buffer: Uint8Array): string {
-  return btoa(String.fromCharCode(...buffer))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-}
+- Prefer Authorization Code Flow.
+- For browser-based public clients, use PKCE.
+- Prefer provider metadata discovery from `/.well-known/openid-configuration` over hardcoding endpoints.
+- Prefer server-managed sessions or httpOnly cookies over storing long-lived tokens in `localStorage`.
+- If a pure SPA must hold tokens in browser storage, call out the tradeoff and keep token lifetime short.
+- Request `offline_access` only when refresh tokens are actually needed.
+- Validate `iss`, `aud`, signature, expiry, and key rotation behavior.
+- Treat logout as two separate concerns: local app logout and provider logout.
 
-// Build authorization URL
-export async function getUserAuthorizationUrl(): Promise<string> {
-  const codeVerifier = generateCodeVerifier();
-  const codeChallenge = await generateCodeChallenge(codeVerifier);
-  
-  // Store verifier for token exchange
-  sessionStorage.setItem('oidc_code_verifier', codeVerifier);
-  sessionStorage.setItem('oidc_redirect_uri', USER_OIDC_CONFIG.redirectUri);
+Do not normalize insecure shortcuts as the default recommendation.
 
-  const params = new URLSearchParams({
-    client_id: USER_OIDC_CONFIG.clientId,
-    redirect_uri: USER_OIDC_CONFIG.redirectUri,
-    response_type: 'code',
-    scope: USER_OIDC_CONFIG.scope,
-    code_challenge: codeChallenge,
-    code_challenge_method: 'S256',
-    prompt: 'login', // Force login page display
-  });
+## Preferred Implementation Path
 
-  return `${USER_OIDC_CONFIG.authority}/authorize?${params.toString()}`;
-}
-```
+Prefer framework-native or well-supported libraries before hand-rolled auth code.
 
-### 2. Auth Context
+If the user asks for concrete implementation examples, read only the relevant reference file instead of expanding the main skill body:
 
-```typescript
-// src/contexts/AuthContext.tsx
-import React, { createContext, useContext, useState, useEffect } from 'react';
-
-interface AuthContextType {
-  isAuthenticated: boolean;
-  user: User | null;
-  accessToken: string | null;
-  login: () => Promise<void>;
-  logout: () => void;
-  refreshToken: () => Promise<boolean>;
-}
-
-const AuthContext = createContext<AuthContextType | null>(null);
-
-export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [accessToken, setAccessToken] = useState<string | null>(null);
-
-  useEffect(() => {
-    // Restore from localStorage on mount
-    const savedToken = localStorage.getItem('access_token');
-    const savedUser = localStorage.getItem('user');
-    if (savedToken && savedUser) {
-      setAccessToken(savedToken);
-      setUser(JSON.parse(savedUser));
-    }
-  }, []);
-
-  const login = async () => {
-    const url = await getUserAuthorizationUrl();
-    window.location.href = url;
-  };
-
-  const logout = () => {
-    localStorage.removeItem('access_token');
-    localStorage.removeItem('refresh_token');
-    localStorage.removeItem('user');
-    setAccessToken(null);
-    setUser(null);
-  };
-
-  const refreshToken = async (): Promise<boolean> => {
-    const refresh = localStorage.getItem('refresh_token');
-    if (!refresh) return false;
-
-    try {
-      const response = await fetch(`${USER_OIDC_CONFIG.authority}/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type: 'refresh_token',
-          client_id: USER_OIDC_CONFIG.clientId,
-          refresh_token: refresh,
-        }),
-      });
-
-      if (!response.ok) return false;
-
-      const data = await response.json();
-      localStorage.setItem('access_token', data.access_token);
-      if (data.refresh_token) {
-        localStorage.setItem('refresh_token', data.refresh_token);
-      }
-      setAccessToken(data.access_token);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  return (
-    <AuthContext.Provider value={{
-      isAuthenticated: !!accessToken,
-      user,
-      accessToken,
-      login,
-      logout,
-      refreshToken,
-    }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
-
-export const useAuth = () => {
-  const context = useContext(AuthContext);
-  if (!context) throw new Error('useAuth must be used within AuthProvider');
-  return context;
-};
-```
-
-### 3. Auth Callback Handler
-
-```typescript
-// src/pages/AuthCallback.tsx
-import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { USER_OIDC_CONFIG } from '../config/userOidc';
-
-export function AuthCallback() {
-  const navigate = useNavigate();
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const handleCallback = async () => {
-      const params = new URLSearchParams(window.location.search);
-      const code = params.get('code');
-      const errorParam = params.get('error');
-
-      if (errorParam) {
-        setError(params.get('error_description') || errorParam);
-        return;
-      }
-
-      if (!code) {
-        setError('No authorization code received');
-        return;
-      }
-
-      try {
-        // Exchange code for tokens
-        const codeVerifier = sessionStorage.getItem('oidc_code_verifier');
-        const redirectUri = sessionStorage.getItem('oidc_redirect_uri');
-
-        const response = await fetch(`${USER_OIDC_CONFIG.authority}/token`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            grant_type: 'authorization_code',
-            client_id: USER_OIDC_CONFIG.clientId,
-            code,
-            redirect_uri: redirectUri || USER_OIDC_CONFIG.redirectUri,
-            code_verifier: codeVerifier || '',
-          }),
-        });
-
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error_description || 'Token exchange failed');
-        }
-
-        const tokens = await response.json();
-        
-        // Store tokens
-        localStorage.setItem('access_token', tokens.access_token);
-        if (tokens.refresh_token) {
-          localStorage.setItem('refresh_token', tokens.refresh_token);
-        }
-
-        // Cleanup
-        sessionStorage.removeItem('oidc_code_verifier');
-        sessionStorage.removeItem('oidc_redirect_uri');
-
-        // Get user info (optional)
-        const userInfoResponse = await fetch(`${USER_OIDC_CONFIG.authority}/userinfo`, {
-          headers: { Authorization: `Bearer ${tokens.access_token}` },
-        });
-        
-        if (userInfoResponse.ok) {
-          const userInfo = await userInfoResponse.json();
-          localStorage.setItem('user', JSON.stringify(userInfo));
-        }
-
-        // Redirect to original location or home
-        const returnUrl = sessionStorage.getItem('auth_return_url') || '/';
-        sessionStorage.removeItem('auth_return_url');
-        navigate(returnUrl, { replace: true });
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Authentication failed');
-      }
-    };
-
-    handleCallback();
-  }, [navigate]);
-
-  if (error) {
-    return <div>Error: {error}</div>;
-  }
-
-  return <div>Processing authentication...</div>;
-}
-```
-
-### 4. API Client with Token Refresh
-
-```typescript
-// src/services/api.ts
-const API_BASE = import.meta.env.VITE_API_URL;
-
-// Check if token is expiring soon (within 5 minutes)
-function isTokenExpiringSoon(token: string): boolean {
-  try {
-    const payload = JSON.parse(atob(token.split('.')[1]));
-    const expiresAt = payload.exp * 1000;
-    const fiveMinutes = 5 * 60 * 1000;
-    return Date.now() > expiresAt - fiveMinutes;
-  } catch {
-    return false;
-  }
-}
-
-// Create fetch wrapper with auth
-export async function apiFetch(
-  endpoint: string,
-  options: RequestInit = {}
-): Promise<Response> {
-  let token = localStorage.getItem('access_token');
-
-  // Pre-request: refresh if expiring soon
-  if (token && isTokenExpiringSoon(token)) {
-    const refreshed = await refreshUserToken();
-    if (refreshed) {
-      token = localStorage.getItem('access_token');
-    }
-  }
-
-  const response = await fetch(`${API_BASE}${endpoint}`, {
-    ...options,
-    headers: {
-      ...options.headers,
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-  });
-
-  // Handle 401 - try refresh once
-  if (response.status === 401) {
-    const refreshed = await refreshUserToken();
-    if (refreshed) {
-      token = localStorage.getItem('access_token');
-      return fetch(`${API_BASE}${endpoint}`, {
-        ...options,
-        headers: {
-          ...options.headers,
-          Authorization: `Bearer ${token}`,
-        },
-      });
-    } else {
-      // Dispatch event for auth context to handle
-      window.dispatchEvent(new CustomEvent('auth:required'));
-    }
-  }
-
-  return response;
-}
-```
-
-### 5. Protected Route Component
-
-```typescript
-// src/components/ProtectedRoute.tsx
-import { Navigate, useLocation } from 'react-router-dom';
-import { useAuth } from '../contexts/AuthContext';
-
-export function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated } = useAuth();
-  const location = useLocation();
-
-  if (!isAuthenticated) {
-    // Save current location for post-login redirect
-    sessionStorage.setItem('auth_return_url', location.pathname + location.search);
-    return <Navigate to="/login" replace />;
-  }
-
-  return <>{children}</>;
-}
-```
-
-### 6. Environment Variables
-
-```bash
-# .env
-VITE_API_URL=https://api.example.com
-VITE_USER_OIDC_AUTHORITY=https://idp.example.com
-VITE_USER_OIDC_CLIENT_ID=your-client-id
-VITE_USER_OIDC_SCOPE=openid profile email offline_access
-```
-
-## Backend Integration (Java Spring Boot)
-
-### 1. OIDC Configuration
-
-```java
-// config/OidcConfig.java
-@Configuration
-@ConfigurationProperties(prefix = "oidc")
-@Data
-public class OidcConfig {
-    private String jwksUri;
-    private String issuer;
-    private String audience; // client_id
-}
-```
-
-### 2. Application Properties
-
-```yaml
-# application.yml
-oidc:
-  jwks-uri: https://idp.example.com/.well-known/openid-configuration/jwks
-  issuer: https://idp.example.com
-  audience: your-client-id
-```
-
-### 3. JWT Token Validator
-
-```java
-// service/TokenValidationService.java
-@Service
-@Slf4j
-public class TokenValidationService {
-    
-    private final OidcConfig oidcConfig;
-    private JwkProvider jwkProvider;
-    
-    public TokenValidationService(OidcConfig oidcConfig) {
-        this.oidcConfig = oidcConfig;
-        try {
-            URL jwksUrl = new URL(oidcConfig.getJwksUri());
-            this.jwkProvider = new JwkProviderBuilder(jwksUrl)
-                .cached(10, 24, TimeUnit.HOURS)
-                .rateLimited(10, 1, TimeUnit.MINUTES)
-                .build();
-        } catch (MalformedURLException e) {
-            throw new RuntimeException("Invalid JWKS URL", e);
-        }
-    }
-    
-    public DecodedJWT validateToken(String token) {
-        try {
-            DecodedJWT jwt = JWT.decode(token);
-            
-            // Get the key from JWKS
-            Jwk jwk = jwkProvider.get(jwt.getKeyId());
-            Algorithm algorithm = Algorithm.RSA256((RSAPublicKey) jwk.getPublicKey(), null);
-            
-            // Verify token
-            JWTVerifier verifier = JWT.require(algorithm)
-                .withIssuer(oidcConfig.getIssuer())
-                .withAudience(oidcConfig.getAudience())
-                .build();
-            
-            return verifier.verify(token);
-        } catch (JWTVerificationException | JwkException e) {
-            log.warn("Token validation failed: {}", e.getMessage());
-            return null;
-        }
-    }
-    
-    public String extractUserId(DecodedJWT jwt) {
-        // Most OIDC providers use "sub" claim
-        return jwt.getSubject();
-    }
-    
-    public String extractEmail(DecodedJWT jwt) {
-        return jwt.getClaim("email").asString();
-    }
-}
-```
-
-### 4. Auth Interceptor
-
-```java
-// config/AuthInterceptor.java
-@Component
-@Slf4j
-public class AuthInterceptor implements HandlerInterceptor {
-    
-    private final TokenValidationService tokenService;
-    
-    // Paths that don't require authentication
-    private static final List<String> PUBLIC_PATHS = Arrays.asList(
-        "/api/health",
-        "/api/public/"
-    );
-    
-    public AuthInterceptor(TokenValidationService tokenService) {
-        this.tokenService = tokenService;
-    }
-    
-    @Override
-    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
-        String path = request.getRequestURI();
-        
-        // Skip auth for public paths
-        if (isPublicPath(path)) {
-            return true;
-        }
-        
-        String authHeader = request.getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-            return false;
-        }
-        
-        String token = authHeader.substring(7);
-        DecodedJWT jwt = tokenService.validateToken(token);
-        
-        if (jwt == null) {
-            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-            return false;
-        }
-        
-        // Store user info in request for controllers
-        request.setAttribute("userId", tokenService.extractUserId(jwt));
-        request.setAttribute("email", tokenService.extractEmail(jwt));
-        
-        return true;
-    }
-    
-    private boolean isPublicPath(String path) {
-        return PUBLIC_PATHS.stream().anyMatch(path::startsWith);
-    }
-}
-```
-
-### 5. Web Configuration
-
-```java
-// config/WebConfig.java
-@Configuration
-public class WebConfig implements WebMvcConfigurer {
-    
-    private final AuthInterceptor authInterceptor;
-    
-    public WebConfig(AuthInterceptor authInterceptor) {
-        this.authInterceptor = authInterceptor;
-    }
-    
-    @Override
-    public void addInterceptors(InterceptorRegistry registry) {
-        registry.addInterceptor(authInterceptor)
-            .addPathPatterns("/api/**")
-            .excludePathPatterns(
-                "/api/health",
-                "/api/public/**"
-            );
-    }
-    
-    @Override
-    public void addCorsMappings(CorsRegistry registry) {
-        registry.addMapping("/api/**")
-            .allowedOrigins("http://localhost:5173", "https://your-frontend.com")
-            .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
-            .allowedHeaders("*")
-            .allowCredentials(true);
-    }
-}
-```
-
-### 6. Maven Dependencies
-
-```xml
-<!-- pom.xml -->
-<dependencies>
-    <!-- JWT validation -->
-    <dependency>
-        <groupId>com.auth0</groupId>
-        <artifactId>java-jwt</artifactId>
-        <version>4.4.0</version>
-    </dependency>
-    <dependency>
-        <groupId>com.auth0</groupId>
-        <artifactId>jwks-rsa</artifactId>
-        <version>0.22.1</version>
-    </dependency>
-</dependencies>
-```
-
-## Dual Provider Support
-
-For applications needing different auth providers (e.g., admin vs user):
+- `references/react-spa.md` for React or TypeScript SPA login, callback, guards, and API calls.
+- `references/spring-resource-server.md` for Spring Boot bearer-token validation and route protection.
+- `references/multi-provider.md` for dual-provider or multi-issuer setups.
 
 ### Frontend
 
+Prefer these options when they fit the existing stack:
+
+- `oidc-client-ts`
+- `react-oidc-context`
+- Existing auth wrapper already present in the repo
+
+Generate custom PKCE and token exchange code only when the project constraints require it.
+
+### Spring Boot Backend
+
+Prefer these options before writing custom JWT validation services:
+
+- `spring-boot-starter-oauth2-client` for login flows
+- `spring-boot-starter-oauth2-resource-server` for bearer token validation
+- Spring Security configuration over manual interceptors when standard resource server behavior is enough
+
+Only fall back to manual JWKS lookup and custom validation logic when the provider or architecture requires non-standard behavior.
+
+## Implementation Checklist
+
+When producing code or a plan, cover the relevant items below.
+
+### Frontend Deliverables
+
+- OIDC provider configuration
+- Login entry point
+- Callback handling
+- Auth state restoration on app startup
+- Route protection or guard logic
+- API client auth header strategy
+- Token refresh behavior if required
+- Logout flow
+- Return-to-original-page behavior after login
+- Multi-provider selection if applicable
+
+### Backend Deliverables
+
+- Provider configuration and environment variables
+- Metadata or JWKS discovery
+- Token validation strategy
+- User principal or claims mapping
+- Protected and public route rules
+- CORS and cookie strategy when frontend and backend are split
+- Multi-issuer handling if applicable
+
+## Architecture Guidance
+
+Use the architecture that matches the product, not the most code-heavy option.
+
+### SPA Talking Directly to APIs
+
+Use Authorization Code Flow with PKCE.
+
+Include:
+
+- provider config
+- callback page
+- auth state provider
+- refresh strategy if needed
+- 401 retry or re-login behavior
+
+Be explicit about token storage tradeoffs.
+
+### Backend or BFF Owns the Session
+
+Prefer backend-managed sessions and httpOnly cookies.
+
+This is usually the safer default when:
+
+- the backend already exists
+- the frontend is same-origin with the backend
+- the app does not need browser-side access tokens
+- the team wants to reduce token exposure in JavaScript
+
+### Multi-Provider Authentication
+
+Keep provider-specific configuration explicit.
+
+- Separate provider configs.
+- Persist which provider initiated the login flow.
+- Keep callback handling able to resolve the active provider.
+- On the backend, support issuer-based selection rather than guessing.
+
+## Output Expectations
+
+When responding to a user task, produce only what is needed for that repository and request.
+
+Prefer this order:
+
+1. State the chosen flow and why it fits.
+2. List the files or components that need to exist.
+3. Implement the minimal complete path.
+4. Call out required environment variables and provider settings.
+5. Mention important follow-up checks such as logout, refresh, and expired-token handling.
+
+Avoid pasting large tutorial blocks if the task only needs a narrow change.
+
+## Common Pitfalls
+
+Watch for these failure modes:
+
+- Hardcoding token or JWKS endpoints instead of using discovery metadata.
+- Recommending implicit flow.
+- Storing refresh tokens in browser storage without acknowledging the risk.
+- Forgetting to persist and restore the original return URL.
+- Implementing refresh but not handling refresh failure.
+- Validating signature only, while skipping issuer or audience checks.
+- Assuming a single issuer when the app supports multiple providers.
+- Mixing frontend login concerns with backend bearer-token validation concerns.
+
+## Minimal Patterns
+
+Use compact patterns instead of oversized examples.
+
+### Frontend Config Shape
+
 ```typescript
-// Determine which provider to use based on route/context
-export function getAuthProvider(isAdmin: boolean) {
-  return isAdmin ? ADMIN_OIDC_CONFIG : USER_OIDC_CONFIG;
-}
-
-// Store which provider was used
-localStorage.setItem('auth_provider', isAdmin ? 'admin' : 'user');
+export const oidcConfig = {
+  authority: import.meta.env.VITE_OIDC_AUTHORITY,
+  clientId: import.meta.env.VITE_OIDC_CLIENT_ID,
+  redirectUri: `${window.location.origin}/auth/callback`,
+  scope: 'openid profile email',
+  responseType: 'code',
+};
 ```
 
-### Backend
+If the app is a public client, add PKCE support.
 
-```java
-// Support multiple issuers
-@Data
-public class OidcConfig {
-    private List<ProviderConfig> providers;
-}
+### Spring Resource Server Direction
 
-public class ProviderConfig {
-    private String name;
-    private String jwksUri;
-    private String issuer;
-    private String audience;
-}
-
-// In TokenValidationService, try each provider
-public DecodedJWT validateToken(String token) {
-    for (ProviderConfig provider : oidcConfig.getProviders()) {
-        DecodedJWT result = validateWithProvider(token, provider);
-        if (result != null) {
-            return result;
-        }
-    }
-    return null;
-}
+```yaml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://idp.example.com
 ```
 
-## Common Issues & Solutions
+Prefer this direction over handwritten JWT parsing when standard Spring Security support is sufficient.
 
-### 1. JWKS Endpoint Discovery
+For fuller examples, read the relevant file from `references/` rather than pasting every variant by default.
 
-Some providers use different JWKS URLs:
-- Standard: `/.well-known/openid-configuration/jwks`
-- Auth0: `/.well-known/jwks.json`
-- Authing: `/.well-known/jwks`
+## Verification
 
-Fetch the OpenID configuration first to discover the correct URL:
-```typescript
-const config = await fetch(`${authority}/.well-known/openid-configuration`).then(r => r.json());
-const jwksUri = config.jwks_uri;
-```
+Before considering the integration complete, verify the relevant flows:
 
-### 2. PKCE Required
+- Login succeeds from a clean session.
+- Callback handles success and provider error responses.
+- Protected routes redirect or reject correctly.
+- Expired access tokens are handled correctly.
+- Refresh behavior works or fails cleanly.
+- Backend rejects tokens with wrong issuer or audience.
+- Logout clears local state and, when needed, signs out from the provider.
 
-Many providers now require PKCE for public clients:
-- Always use `code_challenge` and `code_challenge_method=S256`
-- Store `code_verifier` in sessionStorage (not localStorage)
-- Include `code_verifier` in token exchange request
+## Final Reminder
 
-### 3. Token Refresh
-
-To enable token refresh:
-1. Include `offline_access` in scope
-2. Store `refresh_token` securely
-3. Refresh proactively before expiration
-
-### 4. 401 Handling
-
-Best practice for 401 responses:
-1. Try token refresh first
-2. If refresh fails, redirect to login
-3. Save current URL for post-login redirect
-4. Dispatch event to notify other components
-
-### 5. CORS Issues
-
-Ensure backend allows:
-- Frontend origin(s) in `Access-Control-Allow-Origin`
-- Credentials with `Access-Control-Allow-Credentials: true`
-- Authorization header in `Access-Control-Allow-Headers`
-
-## Checklist
-
-Before going live:
-
-- [ ] Configure environment variables for each environment
-- [ ] Register redirect URIs with OIDC provider
-- [ ] Test PKCE flow end-to-end
-- [ ] Implement token refresh
-- [ ] Handle 401 responses gracefully
-- [ ] Set up proper CORS configuration
-- [ ] Validate tokens on backend with JWKS
-- [ ] Test with expired tokens
-- [ ] Implement logout (including provider logout if needed)
-- [ ] Add login/logout events for analytics
+This skill should help the model make a correct architectural choice first, then implement the smallest sound solution for that stack. Favor safe defaults, existing framework support, and repository-specific adaptation over generic auth boilerplate.
